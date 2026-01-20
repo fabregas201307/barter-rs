@@ -1,7 +1,7 @@
 use chrono::{NaiveDate, NaiveDateTime};
 use prettytable::{Cell, Row, Table, format, row};
 use rust_decimal::{Decimal, MathematicalOps};
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -155,6 +155,7 @@ impl PortfolioState {
 struct EquityPoint {
     ts: Ts,
     nav: Decimal,
+    #[allow(dead_code)]
     pnl: Decimal,
     drawdown: Decimal,
 }
@@ -428,6 +429,7 @@ struct BacktestStats {
     total_return: Decimal,
     max_drawdown: Decimal,
     annualized_return: Decimal,
+    #[allow(dead_code)]
     daily_sharpe: Decimal,
     annualized_sharpe: Decimal,
     annualized_volatility: Decimal,
