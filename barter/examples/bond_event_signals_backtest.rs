@@ -598,8 +598,25 @@ fn print_summary(equity: &[EquityPoint]) {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let marks_path = Path::new("barter/examples/data/bond_marks_template.csv");
-    let signals_path = Path::new("barter/examples/data/bond_signals_template.csv");
+    // Collect command line arguments
+    let args: Vec<String> = std::env::args().collect();
+
+    // Default paths
+    let default_marks = "barter/examples/data/bond_marks_template.csv";
+    let default_signals = "barter/examples/data/bond_signals_template.csv";
+
+    // Usage: cargo run ... -- <marks_path> <signals_path>
+    let (marks_str, signals_str) = if args.len() >= 3 {
+        println!("Using provided paths:\n  Marks: {}\n  Signals: {}", args[1], args[2]);
+        (args[1].as_str(), args[2].as_str())
+    } else {
+        println!("Usage: <binary> <marks_csv> <signals_csv>");
+        println!("No arguments provided. Using defaults:\n  Marks: {}\n  Signals: {}", default_marks, default_signals);
+        (default_marks, default_signals)
+    };
+
+    let marks_path = Path::new(marks_str);
+    let signals_path = Path::new(signals_str);
 
     if !marks_path.exists() {
         return Err(format!("missing marks file: {}", marks_path.display()).into());
