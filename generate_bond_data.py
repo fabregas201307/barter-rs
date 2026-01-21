@@ -1,6 +1,7 @@
 import csv
 import math
 import random
+import string
 from datetime import date, timedelta
 
 # Paths
@@ -12,65 +13,75 @@ start_date = date(2025, 1, 1)
 end_date = date(2026, 1, 1)
 
 # ---------------------------------------------------------
-# 1. Generate MARKS (Daily, Clean Price)
+# Helper Functions
 # ---------------------------------------------------------
-# Simulation params
-s = 0.80  # initial spread
-k = 0.95  # mean reversion speed
-shock_size = 1.50
+def generate_security_id():
+    """Generate a random 9-digit string security ID."""
+    return ''.join(random.choices(string.digits, k=9))
 
-# Define specific dates where we will inject a "widening" shock 
-# so our PAIR strategy has something to trade against.
-entry_dates = [
-    date(2025,1,15),
-    date(2025,3,10),
-    date(2025,5,5),
-    date(2025,6,20),
-    date(2025,8,15),
-    date(2025,10,1),
-    date(2025,11,20),
-    date(2025,12,10),
-]
-shock_map = {d: shock_size for d in entry_dates}
+def generate_trade_suffix():
+    """Generate a random 4-digit string for trade ID."""
+    return ''.join(random.choices(string.digits, k=4))
 
+# ---------------------------------------------------------
+# 1. Setup Universe
+# ---------------------------------------------------------
+NUM_SECURITIES = 500
+security_ids = [generate_security_id() for _ in range(NUM_SECURITIES)]
+# Ensure uniqueness (highly likely with 9 digits, but good practice)
+security_ids = list(set(security_ids)) 
+while len(security_ids) < NUM_SECURITIES:
+    security_ids.append(generate_security_id())
+    security_ids = list(set(security_ids))
+
+# Base price parameters for each security to give them distinct behaviors
+# Each security has a base price level and a volatility multiplier
+security_params = {}
+for sec_id in security_ids:
+    security_params[sec_id] = {
+        'base_price': 100.0 + random.uniform(-10, 10), # Start around 90-110
+        'drift_speed': random.uniform(0.5, 2.0),
+        'volatility': random.uniform(0.01, 0.05),
+        'phase_shift': random.uniform(0, 2 * math.pi)
+    }
+
+# ---------------------------------------------------------
+# 2. Generate MARKS (Daily, Clean Price)
+# ---------------------------------------------------------
 rows_marks = []
 cur = start_date
 t = 0
 
-# We need to track valid trading days for signals to align with marks
-valid_dates = set()
+# To track valid dates for signal generation
+valid_dates = []
+
+print(f"Generating marks for {NUM_SECURITIES} securities...")
 
 while cur <= end_date:
-    valid_dates.add(cur)
+    valid_dates.append(cur)
     
-    # 1. Spread dynamics
-    # Add shock if today is an entry date
-    if cur in shock_map:
-        s += shock_map[cur]
+    # Global market factor (e.g., interest rate moves affecting all bonds)
+    market_factor = 2.0 * math.sin(t / 120.0) + (t / 365.0)
     
-    # Mean reversion towards long-term mean (e.g. 0.50)
-    # s_t = s_{t-1} + k * (mean - s_{t-1}) + noise
-    s += k * (0.50 - s) + random.gauss(0, 0.05)
-    
-    # 2. Base rate / price level dynamics (random walk + drift)
-    # math.sin to create some waves
-    base = 100.0 + 2.0 * math.sin(t / 60.0) + (t / 365.0) * 2.0
-    
-    # 3. Derive bond prices from Base +/- Spread
-    # idiosyncratic noise
-    noise_a = random.gauss(0, 0.02)
-    noise_b = random.gauss(0, 0.02)
-    
-    price_a = base - (s / 2.0) + noise_a
-    price_b = base + (s / 2.0) + noise_b
-    
-    # Clamp to realistic bond prices
-    price_a = max(70.0, min(130.0, price_a))
-    price_b = max(70.0, min(130.0, price_b))
-    
-    rows_marks.append((cur, "BOND_A", "CLEAN_PRICE", f"{price_a:.4f}"))
-    rows_marks.append((cur, "BOND_B", "CLEAN_PRICE", f"{price_b:.4f}"))
-    
+    for sec_id in security_ids:
+        params = security_params[sec_id]
+        
+        # Individual bond dynamics
+        # Price = Base + MarketFactor + IdiosyncraticDrift + Noise
+        
+        # Slow idiosyncratic drift
+        idio_drift = params['drift_speed'] * math.sin(t / 60.0 + params['phase_shift'])
+        
+        # Random noise
+        noise = random.gauss(0, params['volatility'])
+        
+        price = params['base_price'] + market_factor + idio_drift + noise
+        
+        # Clamp to realistic bond prices (distressed to premium)
+        price = max(40.0, min(150.0, price))
+        
+        rows_marks.append((cur, sec_id, "CLEAN_PRICE", f"{price:.4f}"))
+        
     cur += timedelta(days=1)
     t += 1
 
@@ -83,46 +94,73 @@ with open(MARKS_PATH, "w", newline="") as f:
         w.writerow([r[0].isoformat(), r[1], r[2], r[3]])
 
 # ---------------------------------------------------------
-# 2. Generate SIGNALS (Sparse PAIR trades only)
+# 3. Generate SIGNALS (Random Sparse Trades)
 # ---------------------------------------------------------
-# Strategy:
-# On 'entry_date': BUY BOND_A (cheap), SELL BOND_B (rich) -> betting spread narrows.
-# On 'entry_date + 10 days': CLOSE both.
-#
-# Weights: +0.02 for Long, -0.02 for Short (Market Neutral-ish)
+# We will generate random PAIR trades and SINGLE name trades
+# Pair Trade: Long A, Short B
+# Trade ID Format: YYYYMMDD + SecID1[_SecID2...] + RND4
 
 rows_signals = []
-trade_count = 0
+NUM_TRADES = 50 
 
-for i, entry_d in enumerate(entry_dates):
-    # Validate date is in range
-    if entry_d > end_date:
-        continue
-        
-    exit_d = entry_d + timedelta(days=10)
-    if exit_d > end_date:
-        exit_d = end_date # force close at end
-        
-    trade_id = f"PAIR_{i+1:03d}"
-    
-    # ENTRY (Long A, Short B)
-    # Note: Our generic backtester applies delta at close of 'ts' for return on 'ts+1',
-    # OR we can assume fill_mark_override handles the entry execution price.
-    # We'll leave fill_mark_override empty to just use Close Price for simplicity,
-    # or we could simulate a 'fill' slightly worse than close. Let's keep it simple (None).
-    
-    # A: +2%
-    rows_signals.append([entry_d.isoformat(), trade_id, "BOND_A", "0.05", ""])
-    # B: -2%
-    rows_signals.append([entry_d.isoformat(), trade_id, "BOND_B", "-0.05", ""])
-    
-    # EXIT (Close A, Close B) - Reverse signs
-    rows_signals.append([exit_d.isoformat(), trade_id, "BOND_A", "-0.05", ""])
-    rows_signals.append([exit_d.isoformat(), trade_id, "BOND_B", "0.05", ""])
-    
-    trade_count += 1
+print(f"Generating {NUM_TRADES} sparse trades...")
 
-print(f"Generated {len(rows_signals)} signal rows ({trade_count} trades).")
+for _ in range(NUM_TRADES):
+    # Pick a random entry date (leaving at least 20 days for holding)
+    entry_idx = random.randint(0, len(valid_dates) - 21)
+    entry_date = valid_dates[entry_idx]
+    
+    # Holding period 5 to 20 days
+    holding_days = random.randint(5, 20)
+    exit_date = valid_dates[entry_idx + holding_days]
+    
+    # Randomly decide if Pair trade (80%) or Single trade (20%)
+    is_pair = random.random() < 0.8
+    
+    if is_pair:
+        # Pick two distinct securities
+        legs = random.sample(security_ids, 2)
+        sec_a, sec_b = legs[0], legs[1]
+        
+        # Trade ID construction
+        # cleanup date string for ID
+        date_str = entry_date.strftime("%Y%m%d")
+        rnd_suffix = generate_trade_suffix()
+        trade_id = f"{date_str}_{sec_a}_{sec_b}_{rnd_suffix}"
+        
+        # Strategy: Long A, Short B (Mean Reversion bet)
+        # Weights: +/- 5% (0.05)
+        
+        # ENTRY
+        rows_signals.append([entry_date.isoformat(), trade_id, sec_a, "0.05", ""])
+        rows_signals.append([entry_date.isoformat(), trade_id, sec_b, "-0.05", ""])
+        
+        # EXIT (Reverse signs)
+        rows_signals.append([exit_date.isoformat(), trade_id, sec_a, "-0.05", ""])
+        rows_signals.append([exit_date.isoformat(), trade_id, sec_b, "0.05", ""])
+        
+    else:
+        # Single name trade (e.g. directional bet)
+        sec = random.choice(security_ids)
+        
+        date_str = entry_date.strftime("%Y%m%d")
+        rnd_suffix = generate_trade_suffix()
+        trade_id = f"{date_str}_{sec}_{rnd_suffix}"
+        
+        # Direction: Randomly Long or Short
+        direction = 1 if random.random() > 0.5 else -1
+        weight = 0.05 * direction
+        
+        # ENTRY
+        rows_signals.append([entry_date.isoformat(), trade_id, sec, f"{weight:.4f}", ""])
+        
+        # EXIT
+        rows_signals.append([exit_date.isoformat(), trade_id, sec, f"{-weight:.4f}", ""])
+
+# Sort signals by date for cleaner CSV (optional but nice)
+rows_signals.sort(key=lambda x: x[0])
+
+print(f"Generated {len(rows_signals)} signal rows.")
 
 with open(SIGNALS_PATH, "w", newline="") as f:
     w = csv.writer(f)
