@@ -7,57 +7,58 @@ use barter::{
     engine::{
         Engine, Processor,
         state::{
-            EngineState,
-            builder::EngineStateBuilder,
-            global::DefaultGlobalData,
-            instrument::data::{InstrumentDataState},
-            order::in_flight_recorder::InFlightRequestRecorder,
-            trading::TradingState,
-             instrument::filter::InstrumentFilter,
+            EngineState, builder::EngineStateBuilder, global::DefaultGlobalData,
+            instrument::data::InstrumentDataState, instrument::filter::InstrumentFilter,
+            order::in_flight_recorder::InFlightRequestRecorder, trading::TradingState,
         },
     },
     risk::DefaultRiskManager,
     statistic::time::Daily,
     strategy::{
-        algo::AlgoStrategy,
-        close_positions::ClosePositionsStrategy,
-        on_disconnect::OnDisconnectStrategy,
-        on_trading_disabled::OnTradingDisabled,
+        algo::AlgoStrategy, close_positions::ClosePositionsStrategy,
+        on_disconnect::OnDisconnectStrategy, on_trading_disabled::OnTradingDisabled,
     },
     system::config::ExecutionConfig,
 };
 use barter_data::{
     event::MarketEvent,
     streams::consumer::MarketStreamEvent,
-    subscription::{trade::PublicTrade, book::OrderBookL1},
+    subscription::{book::OrderBookL1, trade::PublicTrade},
 };
 use barter_execution::{
     AccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     client::mock::MockExecutionConfig,
     order::{
+        OrderKey, OrderKind, TimeInForce,
+        id::{ClientOrderId, StrategyId},
         request::{OrderRequestCancel, OrderRequestOpen, RequestOpen},
-        OrderKind, OrderKey, TimeInForce,
-        id::{StrategyId, ClientOrderId},
     },
 };
 use barter_instrument::{
-    index::IndexedInstruments,
-    instrument::{
-        Instrument, InstrumentIndex, kind::InstrumentKind, 
-        spec::{InstrumentSpec, InstrumentSpecPrice, InstrumentSpecQuantity, InstrumentSpecNotional, OrderQuantityUnits}, 
-        quote::InstrumentQuoteAsset
-    },
+    Side, Underlying,
+    asset::AssetIndex,
     asset::{Asset, name::AssetNameExchange},
     exchange::{ExchangeId, ExchangeIndex},
-    Underlying, Side,
-    asset::AssetIndex,
+    index::IndexedInstruments,
+    instrument::{
+        Instrument, InstrumentIndex,
+        kind::InstrumentKind,
+        quote::InstrumentQuoteAsset,
+        spec::{
+            InstrumentSpec, InstrumentSpecNotional, InstrumentSpecPrice, InstrumentSpecQuantity,
+            OrderQuantityUnits,
+        },
+    },
 };
+use chrono::{TimeZone, Utc};
 use rust_decimal::{Decimal, prelude::FromPrimitive};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
-use std::{sync::Arc, fmt::{self, Debug}};
-use chrono::{Utc, TimeZone};
+use std::{
+    fmt::{self, Debug},
+    sync::Arc,
+};
 
 // -----------------------------------------------------------
 // 1. Bond Event Customization
@@ -93,7 +94,11 @@ pub struct BondInstrumentData {
 impl InstrumentDataState for BondInstrumentData {
     type MarketEventKind = BondEvent;
     fn price(&self) -> Option<Decimal> {
-         if self.last_price.is_zero() { None } else { Some(self.last_price) }
+        if self.last_price.is_zero() {
+            None
+        } else {
+            Some(self.last_price)
+        }
     }
 }
 
@@ -113,14 +118,26 @@ impl Processor<&MarketEvent<InstrumentIndex, BondEvent>> for BondInstrumentData 
 }
 
 // Implement boilerplate Processor for AccountEvent (required by EngineState)
-impl<ExchangeKey, AssetKey, InstrumentKey> Processor<&AccountEvent<ExchangeKey, AssetKey, InstrumentKey>> for BondInstrumentData {
+impl<ExchangeKey, AssetKey, InstrumentKey>
+    Processor<&AccountEvent<ExchangeKey, AssetKey, InstrumentKey>> for BondInstrumentData
+{
     type Audit = ();
-    fn process(&mut self, _event: &AccountEvent<ExchangeKey, AssetKey, InstrumentKey>) -> Self::Audit {}
+    fn process(
+        &mut self,
+        _event: &AccountEvent<ExchangeKey, AssetKey, InstrumentKey>,
+    ) -> Self::Audit {
+    }
 }
 
 // Implement boilerplate InFlightRequestRecorder (required by EngineState)
-impl<ExchangeKey, InstrumentKey> InFlightRequestRecorder<ExchangeKey, InstrumentKey> for BondInstrumentData {
-    fn record_in_flight_cancel(&mut self, _request: &OrderRequestCancel<ExchangeKey, InstrumentKey>) {}
+impl<ExchangeKey, InstrumentKey> InFlightRequestRecorder<ExchangeKey, InstrumentKey>
+    for BondInstrumentData
+{
+    fn record_in_flight_cancel(
+        &mut self,
+        _request: &OrderRequestCancel<ExchangeKey, InstrumentKey>,
+    ) {
+    }
     fn record_in_flight_open(&mut self, _request: &OrderRequestOpen<ExchangeKey, InstrumentKey>) {}
 }
 
@@ -129,8 +146,7 @@ impl<ExchangeKey, InstrumentKey> InFlightRequestRecorder<ExchangeKey, Instrument
 // -----------------------------------------------------------
 
 #[derive(Clone, Debug, Default)]
-pub struct BondStrategy { 
-}
+pub struct BondStrategy {}
 
 impl AlgoStrategy for BondStrategy {
     type State = EngineState<DefaultGlobalData, BondInstrumentData>;
@@ -142,33 +158,32 @@ impl AlgoStrategy for BondStrategy {
         impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>>,
         impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>>,
     ) {
-         let mut open = Vec::new();
-         // Use enumerate to get valid InstrumentIndex
-         for (i, data) in state.instruments.0.values().enumerate() {
-             if let Some(signal) = data.data.last_signal {
-                 if signal > 0.9 {
-                     
-                     let request_state = RequestOpen {
-                         side: Side::Buy,
-                         price: data.data.last_price,
-                         quantity: Decimal::from(1),
-                         kind: OrderKind::Market,
-                         time_in_force: TimeInForce::FillOrKill, 
-                     };
-                     
-                     open.push(OrderRequestOpen {
-                         key: OrderKey {
-                            exchange: ExchangeIndex(0), 
+        let mut open = Vec::new();
+        // Use enumerate to get valid InstrumentIndex
+        for (i, data) in state.instruments.0.values().enumerate() {
+            if let Some(signal) = data.data.last_signal {
+                if signal > 0.9 {
+                    let request_state = RequestOpen {
+                        side: Side::Buy,
+                        price: data.data.last_price,
+                        quantity: Decimal::from(1),
+                        kind: OrderKind::Market,
+                        time_in_force: TimeInForce::FillOrKill,
+                    };
+
+                    open.push(OrderRequestOpen {
+                        key: OrderKey {
+                            exchange: ExchangeIndex(0),
                             instrument: InstrumentIndex(i),
                             strategy: StrategyId::new("bond_strat"),
                             cid: ClientOrderId::random(),
-                         }, 
-                         state: request_state,
-                     });
-                 }
-             }
-         }
-         (vec![], open)
+                        },
+                        state: request_state,
+                    });
+                }
+            }
+        }
+        (vec![], open)
     }
 }
 
@@ -181,26 +196,53 @@ impl ClosePositionsStrategy for BondStrategy {
     ) -> (
         impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>> + 'a,
         impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>> + 'a,
-    ) 
-    where ExchangeIndex: 'a, AssetIndex: 'a, InstrumentIndex: 'a
+    )
+    where
+        ExchangeIndex: 'a,
+        AssetIndex: 'a,
+        InstrumentIndex: 'a,
     {
         (vec![], vec![])
     }
 }
 
-impl<Clock, ExecutionTxs, Risk> OnDisconnectStrategy<Clock, EngineState<DefaultGlobalData, BondInstrumentData>, ExecutionTxs, Risk> for BondStrategy {
+impl<Clock, ExecutionTxs, Risk>
+    OnDisconnectStrategy<
+        Clock,
+        EngineState<DefaultGlobalData, BondInstrumentData>,
+        ExecutionTxs,
+        Risk,
+    > for BondStrategy
+{
     type OnDisconnect = ();
     fn on_disconnect(
-        _engine: &mut Engine<Clock, EngineState<DefaultGlobalData, BondInstrumentData>, ExecutionTxs, Self, Risk>, 
-        _exchange: ExchangeId
-    ) -> Self::OnDisconnect {}
+        _engine: &mut Engine<
+            Clock,
+            EngineState<DefaultGlobalData, BondInstrumentData>,
+            ExecutionTxs,
+            Self,
+            Risk,
+        >,
+        _exchange: ExchangeId,
+    ) -> Self::OnDisconnect {
+    }
 }
 
-impl<Clock, ExecutionTxs, Risk> OnTradingDisabled<Clock, EngineState<DefaultGlobalData, BondInstrumentData>, ExecutionTxs, Risk> for BondStrategy {
+impl<Clock, ExecutionTxs, Risk>
+    OnTradingDisabled<Clock, EngineState<DefaultGlobalData, BondInstrumentData>, ExecutionTxs, Risk>
+    for BondStrategy
+{
     type OnTradingDisabled = ();
     fn on_trading_disabled(
-        _engine: &mut Engine<Clock, EngineState<DefaultGlobalData, BondInstrumentData>, ExecutionTxs, Self, Risk>
-    ) -> Self::OnTradingDisabled {}
+        _engine: &mut Engine<
+            Clock,
+            EngineState<DefaultGlobalData, BondInstrumentData>,
+            ExecutionTxs,
+            Self,
+            Risk,
+        >,
+    ) -> Self::OnTradingDisabled {
+    }
 }
 
 // -----------------------------------------------------------
@@ -214,30 +256,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A. Instrument
     let bond_asset = Asset::new("US_TREASURY_10Y", "US_TREASURY_10Y");
     let quote_asset = Asset::new("USD", "USD");
-    
+
     // Manual String conversion for name since From not implemented
-    let name_internal = bond_asset.name_internal.to_string(); 
+    let name_internal = bond_asset.name_internal.to_string();
     let name_exchange = bond_asset.name_exchange.to_string();
 
     let bond_instrument = Instrument::new(
-        ExchangeId::BinanceSpot, 
+        ExchangeId::BinanceSpot,
         name_internal,
         name_exchange,
-        Underlying::new(bond_asset.clone(), quote_asset.clone()), 
+        Underlying::new(bond_asset.clone(), quote_asset.clone()),
         InstrumentQuoteAsset::UnderlyingQuote,
         InstrumentKind::Spot,
         Some(InstrumentSpec::new(
             InstrumentSpecPrice::new(Decimal::from(0), Decimal::from(1)),
-            InstrumentSpecQuantity::new(OrderQuantityUnits::Asset(bond_asset.clone()), Decimal::from(0), Decimal::from(1)),
+            InstrumentSpecQuantity::new(
+                OrderQuantityUnits::Asset(bond_asset.clone()),
+                Decimal::from(0),
+                Decimal::from(1),
+            ),
             InstrumentSpecNotional::new(Decimal::from(0)),
-        )), 
+        )),
     );
     let instruments = IndexedInstruments::new(vec![bond_instrument]);
 
     // B. Data
     let t0 = Utc.with_ymd_and_hms(2023, 1, 1, 10, 0, 0).unwrap();
     let t1 = Utc.with_ymd_and_hms(2023, 1, 5, 10, 0, 0).unwrap();
-    
+
     // Synthetic Events
     let events = vec![
         MarketStreamEvent::Item(MarketEvent {
@@ -250,14 +296,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 price: 100.0,
                 amount: 1000.0,
                 side: Side::Buy,
-            })
+            }),
         }),
-         MarketStreamEvent::Item(MarketEvent {
+        MarketStreamEvent::Item(MarketEvent {
             time_exchange: t1,
             time_received: t1,
             exchange: ExchangeId::BinanceSpot,
             instrument: InstrumentIndex(0),
-            kind: BondEvent::AlphaSignal { signal_strength: 0.95 },
+            kind: BondEvent::AlphaSignal {
+                signal_strength: 0.95,
+            },
         }),
     ];
 
@@ -301,13 +349,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 free: Decimal::from(0),
             },
             time_exchange: time_balance_init,
-        }
+        },
     ];
 
     let execution_config = ExecutionConfig::Mock(MockExecutionConfig::new(
         ExchangeId::BinanceSpot,
         UnindexedAccountSnapshot::new(ExchangeId::BinanceSpot, balances, vec![]),
-        100, // latency
+        100,           // latency
         Decimal::ZERO, // fees
     ));
 
@@ -329,11 +377,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Starting Sparse Bond Backtest...");
     let summary = run_backtests(args_constant, std::iter::once(args_dynamic)).await?;
-    
+
     println!("Backtest Success! Duration: {:?}", summary.duration);
     for backtest_summary in summary.summaries {
         backtest_summary.trading_summary.print_summary();
     }
-    
+
     Ok(())
 }

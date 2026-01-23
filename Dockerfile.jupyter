@@ -1,4 +1,22 @@
-# Use the official Rust image (bookworm variant has useful build tools)
+# Stage 1: Build the backtest binary
+FROM rust:1-bookworm AS builder
+
+WORKDIR /usr/src/app
+
+# Install build dependencies required by barter-data/openssl-sys
+RUN apt-get update && apt-get install -y \
+    clang \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the Rust project source code into the builder
+COPY . .
+
+# Pre-build the specific example
+RUN cargo build --release --example bond_event_signals_backtest -p barter
+
+# Stage 2: Jupyter runtime with the prebuilt binary
 FROM rust:1-bookworm
 
 # Install Python 3 and dependencies for Jupyter
@@ -7,9 +25,6 @@ RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     python3-venv \
-    clang \
-    libssl-dev \
-    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # Set up a Python virtual environment for Jupyter
@@ -24,15 +39,18 @@ RUN pip install jupyterlab
 # Set workspace directory
 WORKDIR /workspace
 
-# Copy the Rust project source code into the container
+# Copy the Rust project source code into the container (for notebooks/examples)
 COPY . .
 
-# Pre-build the specific example
-# This ensures dependencies are downloaded and compiled, making the "first run" fast for the user.
-RUN cargo build --release --example bond_event_signals_backtest -p barter
+# Copy the prebuilt binary from the builder stage
+COPY --from=builder /usr/src/app/target/release/examples/bond_event_signals_backtest /usr/local/bin/bond_event_signals_backtest
 
 # Create a dedicated directory for data (mount point for PVC)
 RUN mkdir -p /workspace/data
+
+# Seed default data files into the image (can be overridden by a host mount)
+COPY barter/examples/data/bond_marks_template.csv /workspace/data/
+COPY barter/examples/data/bond_signals_template.csv /workspace/data/
 
 # Expose the standard Jupyter port
 EXPOSE 8888

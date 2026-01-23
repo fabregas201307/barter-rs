@@ -330,7 +330,10 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     {
         self.position
             .update_from_trade(trade)
-            .inspect(|closed| self.tear_sheet.update_from_position(closed))
+            .inspect(|closed| {
+                tracing::info!(?closed.pnl_realised, "Updating TearSheet from Position Close");
+                self.tear_sheet.update_from_position(closed)
+            })
     }
 
     /// Updates the instrument state based on a new market event.

@@ -247,6 +247,15 @@ impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
         // Add TradeId to current Position
         self.trades.push(trade.id.clone());
 
+        tracing::info!(
+            ?self.instrument,
+            current_side = ?self.side,
+            trade_side = ?trade.side,
+            current_qty = ?self.quantity_abs,
+            trade_qty = ?trade.quantity,
+            "Updating Position from Trade"
+        );
+
         use Side::*;
         match (self.side, trade.side) {
             // Increase LONG/SHORT Position
@@ -265,18 +274,61 @@ impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
             }
             // Reduce LONG/SHORT Position
             (Buy, Sell) | (Sell, Buy) if self.quantity_abs > trade.quantity.abs() => {
-                // Update pnl_realised
-                self.update_pnl_realised(trade.quantity, trade.price, trade.fees.fees);
+                // Calculate the values for the closed chunk
+                let closed_quantity = trade.quantity.abs();
+                let closed_fees_enter = self.fees_enter.fees * (closed_quantity / self.quantity_abs);
 
-                // Update remaining Position state
-                self.quantity_abs -= trade.quantity.abs();
-                self.fees_exit.fees += trade.fees.fees;
+                // Realised PnL of the chunk (Gross Exit PnL - Exit Fees)
+                // Note: calculate_pnl_realised expects unsigned closed_quantity
+                let pnl_realised_chunk_exit = calculate_pnl_realised(
+                    self.side,
+                    self.price_entry_average,
+                    closed_quantity,
+                    trade.price,
+                    trade.fees.fees,
+                );
+
+                // Net Realised PnL = (Gross Exit PnL - Exit Fees) - Entry Fees
+                let pnl_realised_chunk_net = pnl_realised_chunk_exit - closed_fees_enter;
+
+                 tracing::info!(
+                    ?self.instrument,
+                    ?closed_quantity,
+                    ?pnl_realised_chunk_net,
+                    "Partial Close Triggered - Emitting PnL"
+                );
+
+                // Create the Partial PositionExited event
+                let closed = PositionExited {
+                    instrument: self.instrument.clone(),
+                    side: self.side,
+                    price_entry_average: self.price_entry_average,
+                    quantity_abs_max: closed_quantity,
+                    pnl_realised: pnl_realised_chunk_net,
+                    fees_enter: AssetFees {
+                        asset: self.fees_enter.asset.clone(),
+                        fees: closed_fees_enter,
+                    },
+                    fees_exit: trade.fees.clone(),
+                    time_enter: self.time_enter,
+                    time_exit: trade.time_exchange,
+                    trades: self.trades.clone(),
+                };
+
+                // Update the REMAINING Position state (Split & Eject Logic)
+                self.quantity_abs -= closed_quantity;
+                self.quantity_abs_max -= closed_quantity;
+                self.fees_enter.fees -= closed_fees_enter;
+
+                // Adjust pnl_realised:
+                // Remove the "Entry Fee Debt" associated with the closed chunk.
+                // We do NOT add the realized exit PnL to self, as we emitted it.
+                self.pnl_realised += closed_fees_enter;
+
                 self.time_exchange_update = trade.time_exchange;
-
-                // Update pnl_unrealised for remaining Position
                 self.update_pnl_unrealised(trade.price);
 
-                (Some(self), None)
+                (Some(self), Some(closed))
             }
             // Close LONG/SHORT Position (exactly)
             (Buy, Sell) | (Sell, Buy) if self.quantity_abs == trade.quantity.abs() => {
@@ -285,6 +337,12 @@ impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
                 self.time_exchange_update = trade.time_exchange;
                 self.update_pnl_realised(trade.quantity, trade.price, trade.fees.fees);
                 self.update_pnl_unrealised(trade.price);
+
+                tracing::info!(
+                    ?self.instrument,
+                    ?self.pnl_realised,
+                    "Full Close Triggered - Emitting PnL"
+                );
 
                 (None, Some(PositionExited::from(self)))
             }
@@ -315,6 +373,13 @@ impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
                 self.fees_exit.fees += fee_exit;
                 self.time_exchange_update = trade.time_exchange;
                 self.update_pnl_realised(self.quantity_abs, trade.price, fee_exit);
+                
+                tracing::info!(
+                    ?self.instrument,
+                    pnl_realised = ?self.pnl_realised,
+                    "Position Flip Triggered - Emitting PnL"
+                );
+
                 self.quantity_abs = Decimal::ZERO;
                 self.update_pnl_unrealised(trade.price);
 

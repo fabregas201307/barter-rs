@@ -1,5 +1,6 @@
 use barter::{
     EngineEvent,
+    engine::state::instrument::data::InstrumentDataState,
     engine::{
         Engine,
         clock::HistoricalClock,
@@ -14,16 +15,13 @@ use barter::{
     risk::DefaultRiskManager,
     statistic::time::Daily,
     strategy::{
-        algo::AlgoStrategy,
-        close_positions::ClosePositionsStrategy,
-        on_disconnect::OnDisconnectStrategy,
-        on_trading_disabled::OnTradingDisabled,
+        algo::AlgoStrategy, close_positions::ClosePositionsStrategy,
+        on_disconnect::OnDisconnectStrategy, on_trading_disabled::OnTradingDisabled,
     },
     system::{
         builder::{AuditMode, EngineFeedMode, SystemArgs, SystemBuilder},
         config::SystemConfig,
     },
-    engine::state::instrument::data::InstrumentDataState,
 };
 use barter_data::{
     event::DataKind,
@@ -32,21 +30,21 @@ use barter_data::{
         reconnect::{Event, stream::ReconnectingStream},
     },
 };
-use barter_instrument::{
-    index::IndexedInstruments, 
-    instrument::InstrumentIndex, 
-    exchange::{ExchangeIndex, ExchangeId}, 
-    asset::AssetIndex,
-    Side
-};
 use barter_execution::order::{
-    request::{OrderRequestCancel, OrderRequestOpen, RequestOpen}, 
-    OrderKind, OrderKey, TimeInForce, 
-    id::{StrategyId, ClientOrderId}
+    OrderKey, OrderKind, TimeInForce,
+    id::{ClientOrderId, StrategyId},
+    request::{OrderRequestCancel, OrderRequestOpen, RequestOpen},
+};
+use barter_instrument::{
+    Side,
+    asset::AssetIndex,
+    exchange::{ExchangeId, ExchangeIndex},
+    index::IndexedInstruments,
+    instrument::InstrumentIndex,
 };
 use futures::{Stream, StreamExt, stream};
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec; 
+use rust_decimal_macros::dec;
 use std::marker::PhantomData;
 
 // --- Custom Strategy to Generate Trades ---
@@ -57,11 +55,15 @@ pub struct BuyAndHoldStrategy<State> {
 
 impl<State> Default for BuyAndHoldStrategy<State> {
     fn default() -> Self {
-        Self { phantom: PhantomData }
+        Self {
+            phantom: PhantomData,
+        }
     }
 }
 
-impl AlgoStrategy<ExchangeIndex, InstrumentIndex> for BuyAndHoldStrategy<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>> {
+impl AlgoStrategy<ExchangeIndex, InstrumentIndex>
+    for BuyAndHoldStrategy<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>
+{
     type State = EngineState<DefaultGlobalData, DefaultInstrumentMarketData>;
 
     fn generate_algo_orders(
@@ -72,52 +74,54 @@ impl AlgoStrategy<ExchangeIndex, InstrumentIndex> for BuyAndHoldStrategy<EngineS
         impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>>,
     ) {
         let mut orders = Vec::new();
-        
+
         // Simple Logic: Buy 0.01 of the first instrument if we have the cash and no position?
         // Actually, let's just spam BUY orders every time we see a price, effectively.
         // The Risk Manager and Execution balance checks will filter invalid ones or stop us running out of money.
         // For a clean backtest, let's just buy once.
-        
-        // In a real strategy, we'd check `state.instruments.get(...)` for position and market data.
-        
-        for (_index, data) in state.instruments.0.iter() {
-             // If we have a market price
-             if let Some(price) = data.data.price() {
-                 let instrument_index = data.key;
-                 
-                 // Check if we already have a position?
-                 let position = data.position.current.as_ref();
-                 let current_position = position.map(|p| p.quantity_abs).unwrap_or(Decimal::ZERO);
-                 
-                 // Prevent spamming orders if we already have open orders or hold enough
-                 if !data.orders.0.is_empty() || current_position >= dec!(0.1) {
-                     continue;
-                 }
 
-                 // Buy if we hold less than 0.1
-                 orders.push(OrderRequestOpen {
-                         key: OrderKey {
-                             exchange: ExchangeIndex(0),
-                             instrument: instrument_index,
-                             strategy: StrategyId::new("buy_hold"),
-                             cid: ClientOrderId::random(),
-                         },
-                         state: RequestOpen {
-                             side: Side::Buy,
-                             price: price, 
-                             quantity: dec!(0.01),
-                             kind: OrderKind::Market,
-                             time_in_force: TimeInForce::FillOrKill,
-                         }
-                     });
-             }
+        // In a real strategy, we'd check `state.instruments.get(...)` for position and market data.
+
+        for (_index, data) in state.instruments.0.iter() {
+            // If we have a market price
+            if let Some(price) = data.data.price() {
+                let instrument_index = data.key;
+
+                // Check if we already have a position?
+                let position = data.position.current.as_ref();
+                let current_position = position.map(|p| p.quantity_abs).unwrap_or(Decimal::ZERO);
+
+                // Prevent spamming orders if we already have open orders or hold enough
+                if !data.orders.0.is_empty() || current_position >= dec!(0.1) {
+                    continue;
+                }
+
+                // Buy if we hold less than 0.1
+                orders.push(OrderRequestOpen {
+                    key: OrderKey {
+                        exchange: ExchangeIndex(0),
+                        instrument: instrument_index,
+                        strategy: StrategyId::new("buy_hold"),
+                        cid: ClientOrderId::random(),
+                    },
+                    state: RequestOpen {
+                        side: Side::Buy,
+                        price: price,
+                        quantity: dec!(0.01),
+                        kind: OrderKind::Market,
+                        time_in_force: TimeInForce::FillOrKill,
+                    },
+                });
+            }
         }
 
         (vec![], orders)
     }
 }
 
-impl ClosePositionsStrategy<ExchangeIndex, AssetIndex, InstrumentIndex> for BuyAndHoldStrategy<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>> {
+impl ClosePositionsStrategy<ExchangeIndex, AssetIndex, InstrumentIndex>
+    for BuyAndHoldStrategy<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>
+{
     type State = EngineState<DefaultGlobalData, DefaultInstrumentMarketData>;
     fn close_positions_requests<'a>(
         &'a self,
@@ -126,26 +130,57 @@ impl ClosePositionsStrategy<ExchangeIndex, AssetIndex, InstrumentIndex> for BuyA
     ) -> (
         impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>> + 'a,
         impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>> + 'a,
-    ) 
-    where ExchangeIndex: 'a, AssetIndex: 'a, InstrumentIndex: 'a
+    )
+    where
+        ExchangeIndex: 'a,
+        AssetIndex: 'a,
+        InstrumentIndex: 'a,
     {
         (vec![], vec![])
     }
 }
 
-impl<Clock, ExecutionTxs, Risk> OnDisconnectStrategy<Clock, EngineState<DefaultGlobalData, DefaultInstrumentMarketData>, ExecutionTxs, Risk> for BuyAndHoldStrategy<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>> {
+impl<Clock, ExecutionTxs, Risk>
+    OnDisconnectStrategy<
+        Clock,
+        EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
+        ExecutionTxs,
+        Risk,
+    > for BuyAndHoldStrategy<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>
+{
     type OnDisconnect = ();
     fn on_disconnect(
-        _engine: &mut Engine<Clock, EngineState<DefaultGlobalData, DefaultInstrumentMarketData>, ExecutionTxs, Self, Risk>, 
-        _exchange: ExchangeId
-    ) -> Self::OnDisconnect {}
+        _engine: &mut Engine<
+            Clock,
+            EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
+            ExecutionTxs,
+            Self,
+            Risk,
+        >,
+        _exchange: ExchangeId,
+    ) -> Self::OnDisconnect {
+    }
 }
 
-impl<Clock, ExecutionTxs, Risk> OnTradingDisabled<Clock, EngineState<DefaultGlobalData, DefaultInstrumentMarketData>, ExecutionTxs, Risk> for BuyAndHoldStrategy<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>> {
+impl<Clock, ExecutionTxs, Risk>
+    OnTradingDisabled<
+        Clock,
+        EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
+        ExecutionTxs,
+        Risk,
+    > for BuyAndHoldStrategy<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>
+{
     type OnTradingDisabled = ();
     fn on_trading_disabled(
-        _engine: &mut Engine<Clock, EngineState<DefaultGlobalData, DefaultInstrumentMarketData>, ExecutionTxs, Self, Risk>
-    ) -> Self::OnTradingDisabled {}
+        _engine: &mut Engine<
+            Clock,
+            EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
+            ExecutionTxs,
+            Self,
+            Risk,
+        >,
+    ) -> Self::OnTradingDisabled {
+    }
 }
 // ----------------------------------------
 use std::{fs::File, io::BufReader, time::Duration};

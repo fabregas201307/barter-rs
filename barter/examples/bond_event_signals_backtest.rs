@@ -1,7 +1,7 @@
 use chrono::{NaiveDate, NaiveDateTime};
 use prettytable::{Cell, Row, Table, format, row};
-use rust_decimal::{Decimal, MathematicalOps};
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::{Decimal, MathematicalOps};
 use rust_decimal_macros::dec;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -102,9 +102,8 @@ impl TradeLegState {
             let abs_add = delta.abs();
             let total_abs = self.abs_weight_basis + abs_add;
             if total_abs > Decimal::ZERO {
-                self.avg_exec_mark = (self.avg_exec_mark * self.abs_weight_basis
-                    + exec_mark * abs_add)
-                    / total_abs;
+                self.avg_exec_mark =
+                    (self.avg_exec_mark * self.abs_weight_basis + exec_mark * abs_add) / total_abs;
                 self.abs_weight_basis = total_abs;
             }
             self.weight = new_weight;
@@ -205,11 +204,7 @@ fn read_signals_csv(path: &Path) -> Result<Vec<SignalRow>, Box<dyn Error>> {
             .get(4)
             .and_then(|s| {
                 let s = s.trim();
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s)
-                }
+                if s.is_empty() { None } else { Some(s) }
             })
             .map(|s| s.parse::<Decimal>())
             .transpose()
@@ -296,7 +291,9 @@ fn validate_trade_closure(signals: &BTreeMap<Ts, Vec<SignalRow>>) -> Result<(), 
     if !bad.is_empty() {
         let mut msg = String::from("trade closure validation failed (sum delta_weight != 0):\n");
         for (trade_id, security_id, sum) in bad {
-            msg.push_str(&format!("  trade_id={trade_id} security_id={security_id} sum={sum}\n"));
+            msg.push_str(&format!(
+                "  trade_id={trade_id} security_id={security_id} sum={sum}\n"
+            ));
         }
         return Err(msg.into());
     }
@@ -354,7 +351,9 @@ fn compute_equity_curve(
                 let close_mark = *prepared
                     .marks
                     .get(&(s.ts, s.security_id.clone()))
-                    .ok_or_else(|| format!("missing close mark on signal day for {}", s.security_id))?;
+                    .ok_or_else(|| {
+                        format!("missing close mark on signal day for {}", s.security_id)
+                    })?;
 
                 let exec_mark = s.fill_mark_override.unwrap_or(close_mark);
 
@@ -423,7 +422,6 @@ fn compute_equity_curve(
     Ok(equity)
 }
 
-
 #[derive(Debug, Clone)]
 struct BacktestStats {
     total_return: Decimal,
@@ -453,18 +451,19 @@ impl BacktestStats {
         let first = equity.first().unwrap();
         let last = equity.last().unwrap();
         let total_return = (last.nav / first.nav) - dec!(1.0);
-        
-        let max_drawdown = equity.iter()
+
+        let max_drawdown = equity
+            .iter()
             .map(|p| p.drawdown)
             .min()
             .unwrap_or(Decimal::ZERO);
 
         let trading_days = equity.len();
-        
+
         // Calculate daily returns for Sharpe/Vol
         let mut daily_returns: Vec<Decimal> = Vec::with_capacity(trading_days - 1);
         for i in 1..trading_days {
-            let prev_nav = equity[i-1].nav;
+            let prev_nav = equity[i - 1].nav;
             let curr_nav = equity[i].nav;
             if prev_nav != Decimal::ZERO {
                 let r = (curr_nav / prev_nav) - dec!(1.0);
@@ -473,21 +472,22 @@ impl BacktestStats {
         }
 
         let (mean_ret, std_dev) = if !daily_returns.is_empty() {
-             let sum: Decimal = daily_returns.iter().sum();
-             let count = Decimal::from(daily_returns.len());
-             let mean = sum / count;
-             
-             let variance_sum: Decimal = daily_returns.iter()
-                 .map(|&r| (r - mean) * (r - mean))
-                 .sum();
-             
-             // Sample std dev (n-1)
-             let std_dev = if count > dec!(1.0) {
-                 (variance_sum / (count - dec!(1.0))).sqrt().unwrap_or(Decimal::ZERO)
-             } else {
-                 Decimal::ZERO
-             };
-             (mean, std_dev)
+            let sum: Decimal = daily_returns.iter().sum();
+            let count = Decimal::from(daily_returns.len());
+            let mean = sum / count;
+
+            let variance_sum: Decimal =
+                daily_returns.iter().map(|&r| (r - mean) * (r - mean)).sum();
+
+            // Sample std dev (n-1)
+            let std_dev = if count > dec!(1.0) {
+                (variance_sum / (count - dec!(1.0)))
+                    .sqrt()
+                    .unwrap_or(Decimal::ZERO)
+            } else {
+                Decimal::ZERO
+            };
+            (mean, std_dev)
         } else {
             (Decimal::ZERO, Decimal::ZERO)
         };
@@ -498,27 +498,27 @@ impl BacktestStats {
         let sqrt_days = days_in_year.sqrt().unwrap_or(dec!(19.1));
 
         let annualized_volatility = std_dev * sqrt_days;
-        
+
         let daily_sharpe = if std_dev != Decimal::ZERO {
             mean_ret / std_dev
         } else {
             Decimal::ZERO
         };
-        
+
         let annualized_sharpe = daily_sharpe * sqrt_days;
 
         // CAGR / Annualized Return
         // (1 + total)^ (365 / days) - 1
         let days_dec = Decimal::from(trading_days);
-        // Using f64 for power because rust_decimal power is limited or tricky? 
+        // Using f64 for power because rust_decimal power is limited or tricky?
         // actually rust_decimal has `powf` via `MathematicalOps` via feature "maths".
         // Dependencies usually enable features. I'll use f64 conversion for safety/ease if needed,
         // but let's try to stick to Decimal or approximate.
         // Actually, let's use f64 for the exponentiation to be safe.
-        
+
         let total_ret_f64 = total_return.to_f64().unwrap_or(0.0);
         let year_fraction = days_dec.to_f64().unwrap_or(1.0) / 365.0;
-        
+
         let annualized_return = if year_fraction > 0.0 {
             let val = (1.0_f64 + total_ret_f64).powf(1.0_f64 / year_fraction) - 1.0_f64;
             Decimal::from_f64_retain(val).unwrap_or(Decimal::ZERO)
@@ -540,28 +540,28 @@ impl BacktestStats {
 
 fn print_summary(equity: &[EquityPoint]) {
     let stats = BacktestStats::calculate(equity);
-    
+
     println!();
-    
+
     // Title Table
     let mut title_table = Table::new();
     title_table.set_format(*format::consts::FORMAT_CLEAN);
     title_table.add_row(Row::new(vec![
-        Cell::new("BOND EVENT BACKTEST SUMMARY").style_spec("bB")
+        Cell::new("BOND EVENT BACKTEST SUMMARY").style_spec("bB"),
     ]));
     title_table.printstd();
 
     // Metrics Table
     let mut table = Table::new();
     table.set_format(*format::consts::FORMAT_BOX_CHARS);
-    
+
     table.add_row(row![bFc => "Metric", "Value"]);
-    
+
     table.add_row(Row::new(vec![
         Cell::new("Total Return"),
         Cell::new(&format!("{:.4}%", stats.total_return * dec!(100.0))),
     ]));
-    
+
     table.add_row(Row::new(vec![
         Cell::new("Annualized Return (CAGR)"),
         Cell::new(&format!("{:.4}%", stats.annualized_return * dec!(100.0))),
@@ -574,14 +574,17 @@ fn print_summary(equity: &[EquityPoint]) {
 
     table.add_row(Row::new(vec![
         Cell::new("Annualized Volatility"),
-        Cell::new(&format!("{:.4}%", stats.annualized_volatility * dec!(100.0))),
+        Cell::new(&format!(
+            "{:.4}%",
+            stats.annualized_volatility * dec!(100.0)
+        )),
     ]));
 
     table.add_row(Row::new(vec![
         Cell::new("Sharpe Ratio (Ann.)"),
         Cell::new(&format!("{:.4}", stats.annualized_sharpe)),
     ]));
-    
+
     table.add_row(Row::new(vec![
         Cell::new("Trading Days"),
         Cell::new(&format!("{}", stats.trading_days)),
@@ -609,11 +612,17 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Usage: cargo run ... -- <marks_path> <signals_path>
     let (marks_str, signals_str) = if args.len() >= 3 {
-        println!("Using provided paths:\n  Marks: {}\n  Signals: {}", args[1], args[2]);
+        println!(
+            "Using provided paths:\n  Marks: {}\n  Signals: {}",
+            args[1], args[2]
+        );
         (args[1].as_str(), args[2].as_str())
     } else {
         println!("Usage: <binary> <marks_csv> <signals_csv>");
-        println!("No arguments provided. Using defaults:\n  Marks: {}\n  Signals: {}", default_marks, default_signals);
+        println!(
+            "No arguments provided. Using defaults:\n  Marks: {}\n  Signals: {}",
+            default_marks, default_signals
+        );
         (default_marks, default_signals)
     };
 

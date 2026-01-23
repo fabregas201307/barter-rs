@@ -1,6 +1,5 @@
 use crate::{EngineEvent, engine::Processor, execution::AccountStreamEvent};
 use barter_data::streams::consumer::MarketStreamEvent;
-use barter_execution::AccountEventKind;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, ops::Add, sync::Arc};
@@ -148,17 +147,7 @@ impl<MarketEventKind: Debug> TimeExchange for EngineEvent<MarketEventKind> {
     fn time_exchange(&self) -> Option<DateTime<Utc>> {
         match self {
             Self::Market(MarketStreamEvent::Item(event)) => Some(event.time_exchange),
-            Self::Account(AccountStreamEvent::Item(event)) => match &event.kind {
-                AccountEventKind::Snapshot(snapshot) => snapshot.time_most_recent(),
-                AccountEventKind::BalanceSnapshot(balance) => Some(balance.0.time_exchange),
-                AccountEventKind::OrderSnapshot(order) => order.0.state.time_exchange(),
-                AccountEventKind::OrderCancelled(response) => response
-                    .state
-                    .as_ref()
-                    .map(|cancelled| cancelled.time_exchange)
-                    .ok(),
-                AccountEventKind::Trade(trade) => Some(trade.time_exchange),
-            },
+            Self::Account(AccountStreamEvent::Item(_)) => None,
             _ => None,
         }
     }
