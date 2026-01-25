@@ -49,6 +49,7 @@ for sec_id in security_ids:
 # 2. Generate MARKS (Daily, Clean Price)
 # ---------------------------------------------------------
 rows_marks = []
+marks_by_date_sec = {}
 cur = start_date
 t = 0
 
@@ -81,6 +82,7 @@ while cur <= end_date:
         price = max(40.0, min(150.0, price))
         
         rows_marks.append((cur, sec_id, "CLEAN_PRICE", f"{price:.4f}"))
+        marks_by_date_sec[(cur, sec_id)] = price
         
     cur += timedelta(days=1)
     t += 1
@@ -132,7 +134,16 @@ for _ in range(NUM_TRADES):
         # Weights: +/- 5% (0.05)
         
         # ENTRY
-        rows_signals.append([entry_date.isoformat(), trade_id, sec_a, "0.05", ""])
+        entry_mark_a = marks_by_date_sec[(entry_date, sec_a)]
+        issue_concession_a = random.uniform(0.001, 0.005)
+        issue_price_a = entry_mark_a * (1.0 - issue_concession_a)
+        rows_signals.append([
+            entry_date.isoformat(),
+            trade_id,
+            sec_a,
+            "0.05",
+            f"{issue_price_a:.4f}",
+        ])
         rows_signals.append([entry_date.isoformat(), trade_id, sec_b, "-0.05", ""])
         
         # EXIT (Reverse signs)
@@ -152,7 +163,14 @@ for _ in range(NUM_TRADES):
         weight = 0.05 * direction
         
         # ENTRY
-        rows_signals.append([entry_date.isoformat(), trade_id, sec, f"{weight:.4f}", ""])
+        if weight > 0:
+            entry_mark = marks_by_date_sec[(entry_date, sec)]
+            issue_concession = random.uniform(0.001, 0.005)
+            issue_price = entry_mark * (1.0 - issue_concession)
+            fill_override = f"{issue_price:.4f}"
+        else:
+            fill_override = ""
+        rows_signals.append([entry_date.isoformat(), trade_id, sec, f"{weight:.4f}", fill_override])
         
         # EXIT
         rows_signals.append([exit_date.isoformat(), trade_id, sec, f"{-weight:.4f}", ""])
