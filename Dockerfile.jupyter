@@ -1,5 +1,5 @@
 # Stage 1: Build the backtest binary
-FROM rust:1-bookworm AS builder
+FROM rust:1.91 AS builder
 
 WORKDIR /usr/src/app
 
@@ -17,7 +17,7 @@ COPY . .
 RUN cargo build --release --example bond_event_signals_backtest -p barter
 
 # Stage 2: Jupyter runtime with the prebuilt binary
-FROM rust:1-bookworm
+FROM rust:1.91
 
 # Install Python 3 and dependencies for Jupyter
 # We run `apt-get update` and install python3-venv for environment management

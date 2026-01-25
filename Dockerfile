@@ -1,6 +1,6 @@
 # Stage 1: Builder
 # Use the official Rust image (using slim-bookworm for a smaller initial footprint that matches runtime)
-FROM rust:1-slim-bookworm as builder
+FROM rust:1.91 as builder
 
 WORKDIR /usr/src/app
 
