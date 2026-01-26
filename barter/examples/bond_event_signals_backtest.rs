@@ -228,6 +228,8 @@ struct PreparedData {
     marks: HashMap<(Ts, String), Decimal>,
     // signals by date
     signals_by_ts: BTreeMap<Ts, Vec<SignalRow>>,
+    trade_count_total: usize,
+    trade_count_dropped: usize,
 }
 
 fn prepare_data(
@@ -254,6 +256,7 @@ fn prepare_data(
         signals_by_trade.entry(s.trade_id.clone()).or_default().push(s);
     }
 
+    let trade_count_total = signals_by_trade.len();
     let mut valid_signals = Vec::new();
     let mut dropped_trades = HashSet::new();
 
@@ -303,10 +306,11 @@ fn prepare_data(
         }
     }
 
+    let trade_count_dropped = dropped_trades.len();
     if !dropped_trades.is_empty() {
         println!(
             "WARNING: dropped {} trade_ids due to missing marks (e.g. {:?})",
-            dropped_trades.len(),
+            trade_count_dropped,
             dropped_trades.iter().take(3).collect::<Vec<_>>()
         );
     }
@@ -323,6 +327,8 @@ fn prepare_data(
         calendar,
         marks: marks_map,
         signals_by_ts,
+        trade_count_total,
+        trade_count_dropped,
     })
 }
 
@@ -574,8 +580,18 @@ impl BacktestStats {
     }
 }
 
-fn print_summary(equity: &[EquityPoint]) {
+fn print_summary(
+    equity: &[EquityPoint],
+    trade_total: usize,
+    trade_dropped: usize,
+) {
     let stats = BacktestStats::calculate(equity);
+    let trade_executed = trade_total.saturating_sub(trade_dropped);
+    let execution_rate = if trade_total > 0 {
+        (trade_executed as f64 / trade_total as f64) * 100.0
+    } else {
+        0.0
+    };
 
     println!();
 
@@ -592,6 +608,28 @@ fn print_summary(equity: &[EquityPoint]) {
     table.set_format(*format::consts::FORMAT_BOX_CHARS);
 
     table.add_row(row![bFc => "Metric", "Value"]);
+
+    table.add_row(Row::new(vec![
+        Cell::new("Total Signals (unique trade_id)"),
+        Cell::new(&format!("{}", trade_total)),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Dropped trades (missing marks)"),
+        Cell::new(&format!("{}", trade_dropped)).style_spec("Fr"),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Executed trades"),
+        Cell::new(&format!("{}", trade_executed)).style_spec("Fg"),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Execution Rate"),
+        Cell::new(&format!("{:.2}%", execution_rate)),
+    ]));
+
+    table.add_row(row!["", ""]);
 
     table.add_row(Row::new(vec![
         Cell::new("Total Return"),
@@ -682,7 +720,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     validate_trade_closure(&prepared.signals_by_ts)?;
 
     let equity = compute_equity_curve(&prepared, mark_type)?;
-    print_summary(&equity);
+    print_summary(
+        &equity,
+        prepared.trade_count_total,
+        prepared.trade_count_dropped,
+    );
 
     Ok(())
 }
