@@ -1,6 +1,6 @@
 use chrono::{NaiveDate, NaiveDateTime};
 use prettytable::{Cell, Row, Table, format, row};
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::{Decimal, MathematicalOps};
 use rust_decimal_macros::dec;
 use std::{
@@ -63,6 +63,58 @@ struct TradeLegState {
     avg_exec_mark: Decimal,
     // Total absolute executed weight used for avg.
     abs_weight_basis: Decimal,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExposureStats {
+    avg_gross: Decimal,
+    max_gross: Decimal,
+    avg_net: Decimal,
+    max_net: Decimal,
+    max_abs_pos: Decimal,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TurnoverStats {
+    total: Decimal,
+    avg_daily: Decimal,
+    max_daily: Decimal,
+}
+
+#[derive(Debug, Clone)]
+struct DrawdownStats {
+    start: Ts,
+    trough: Ts,
+    recovery: Option<Ts>,
+    duration_days: i64,
+    recovery_days: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct TradeResult {
+    trade_id: String,
+    entry: Ts,
+    exit: Ts,
+    trade_return: Decimal,
+    holding_days: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TradeStats {
+    total: usize,
+    wins: usize,
+    losses: usize,
+    win_rate: Decimal,
+    avg_win: Decimal,
+    avg_loss: Decimal,
+    payoff_ratio: Decimal,
+    profit_factor: Decimal,
+    mean_return: Decimal,
+    std_return: Decimal,
+    avg_hold_days: Decimal,
+    median_hold_days: Decimal,
+    long_hit_rate: Decimal,
+    short_hit_rate: Decimal,
 }
 
 impl TradeLegState {
@@ -367,9 +419,16 @@ fn validate_trade_closure(signals: &BTreeMap<Ts, Vec<SignalRow>>) -> Result<(), 
 fn compute_equity_curve(
     prepared: &PreparedData,
     mark_type: MarkType,
-) -> Result<Vec<EquityPoint>, Box<dyn Error>> {
+) -> Result<(Vec<EquityPoint>, ExposureStats), Box<dyn Error>> {
     let mut portfolio = PortfolioState::new();
     let mut equity = Vec::new();
+
+    let mut sum_gross = Decimal::ZERO;
+    let mut sum_net = Decimal::ZERO;
+    let mut max_gross = Decimal::ZERO;
+    let mut max_net = Decimal::ZERO;
+    let mut max_abs_pos = Decimal::ZERO;
+    let mut exposure_points = 0usize;
 
     // NAV starts at 1.0
     let mut nav = dec!(1.0);
@@ -428,6 +487,26 @@ fn compute_equity_curve(
             drawdown: drawdown_at_close,
         });
 
+        // Exposure stats at close of ts
+        let mut gross = Decimal::ZERO;
+        let mut net = Decimal::ZERO;
+        for w in portfolio.weights.values() {
+            gross += w.abs();
+            net += *w;
+            if w.abs() > max_abs_pos {
+                max_abs_pos = w.abs();
+            }
+        }
+        if gross > max_gross {
+            max_gross = gross;
+        }
+        if net.abs() > max_net.abs() {
+            max_net = net;
+        }
+        sum_gross += gross;
+        sum_net += net;
+        exposure_points += 1;
+
         // 2) Close-to-close return from ts -> next_ts uses post-signal weights.
         if idx + 1 >= prepared.calendar.len() {
             break;
@@ -461,7 +540,368 @@ fn compute_equity_curve(
     // make the API explicit.
     let _ = mark_type;
 
-    Ok(equity)
+    let avg_gross = if exposure_points > 0 {
+        sum_gross / Decimal::from(exposure_points)
+    } else {
+        Decimal::ZERO
+    };
+    let avg_net = if exposure_points > 0 {
+        sum_net / Decimal::from(exposure_points)
+    } else {
+        Decimal::ZERO
+    };
+
+    let exposure = ExposureStats {
+        avg_gross,
+        max_gross,
+        avg_net,
+        max_net,
+        max_abs_pos,
+    };
+
+    Ok((equity, exposure))
+}
+
+fn compute_turnover_stats(prepared: &PreparedData) -> TurnoverStats {
+    let mut total = Decimal::ZERO;
+    let mut max_daily = Decimal::ZERO;
+
+    for rows in prepared.signals_by_ts.values() {
+        let mut daily = Decimal::ZERO;
+        for s in rows {
+            daily += s.delta_weight.abs();
+        }
+        if daily > max_daily {
+            max_daily = daily;
+        }
+        total += daily;
+    }
+
+    let avg_daily = if prepared.calendar.is_empty() {
+        Decimal::ZERO
+    } else {
+        total / Decimal::from(prepared.calendar.len())
+    };
+
+    TurnoverStats {
+        total,
+        avg_daily,
+        max_daily,
+    }
+}
+
+fn compute_drawdown_stats(equity: &[EquityPoint]) -> DrawdownStats {
+    let first = equity.first().expect("equity not empty");
+    let mut peak_nav = first.nav;
+    let mut peak_ts = first.ts;
+
+    let mut trough_nav = first.nav;
+    let mut trough_ts = first.ts;
+
+    let mut max_drawdown = Decimal::ZERO;
+    let mut max_start = first.ts;
+    let mut max_trough = first.ts;
+    let mut max_recovery: Option<Ts> = None;
+    let mut max_peak_ts = first.ts;
+
+    for p in equity.iter().skip(1) {
+        if p.nav > peak_nav {
+            // Recovery from current peak
+            if max_recovery.is_none() && peak_ts == max_peak_ts {
+                max_recovery = Some(p.ts);
+            }
+            peak_nav = p.nav;
+            peak_ts = p.ts;
+            trough_nav = p.nav;
+            trough_ts = p.ts;
+            continue;
+        }
+
+        if p.nav < trough_nav {
+            trough_nav = p.nav;
+            trough_ts = p.ts;
+        }
+
+        let dd = (p.nav / peak_nav) - dec!(1.0);
+        if dd < max_drawdown {
+            max_drawdown = dd;
+            max_start = peak_ts;
+            max_trough = trough_ts;
+            max_peak_ts = peak_ts;
+            max_recovery = None;
+        }
+    }
+
+    let duration_days = (max_trough.0 - max_start.0).num_days();
+    let recovery_days = max_recovery.map(|r| (r.0 - max_start.0).num_days());
+
+    let _ = max_drawdown;
+    DrawdownStats {
+        start: max_start,
+        trough: max_trough,
+        recovery: max_recovery,
+        duration_days,
+        recovery_days,
+    }
+}
+
+fn compute_trade_stats(prepared: &PreparedData) -> (TradeStats, Vec<TradeResult>) {
+    let mut trades: HashMap<String, Vec<SignalRow>> = HashMap::new();
+    for rows in prepared.signals_by_ts.values() {
+        for s in rows {
+            trades.entry(s.trade_id.clone()).or_default().push(s.clone());
+        }
+    }
+
+    let mut calendar_index: HashMap<Ts, usize> = HashMap::new();
+    for (i, ts) in prepared.calendar.iter().enumerate() {
+        calendar_index.insert(*ts, i);
+    }
+
+    let mut results: Vec<TradeResult> = Vec::new();
+    let mut holding_days: Vec<i64> = Vec::new();
+    let mut win_sum = Decimal::ZERO;
+    let mut loss_sum = Decimal::ZERO;
+    let mut wins = 0usize;
+    let mut losses = 0usize;
+
+    let mut long_wins = 0usize;
+    let mut long_total = 0usize;
+    let mut short_wins = 0usize;
+    let mut short_total = 0usize;
+
+    for (trade_id, mut rows) in trades {
+        rows.sort_by_key(|r| r.ts);
+        let entry = rows.first().unwrap().ts;
+        let exit = rows.last().unwrap().ts;
+
+        let entry_idx = calendar_index.get(&entry).cloned().unwrap_or(0);
+        let exit_idx = calendar_index
+            .get(&exit)
+            .cloned()
+            .unwrap_or(entry_idx);
+
+        let hold_days = (exit_idx as i64 - entry_idx as i64) + 1;
+
+        let mut rows_by_ts: BTreeMap<Ts, Vec<SignalRow>> = BTreeMap::new();
+        for r in &rows {
+            rows_by_ts.entry(r.ts).or_default().push(r.clone());
+        }
+
+        // Leg hit ratios (entry to exit)
+        let mut sec_rows: HashMap<String, Vec<SignalRow>> = HashMap::new();
+        for r in &rows {
+            sec_rows.entry(r.security_id.clone()).or_default().push(r.clone());
+        }
+        for (_sec, mut srows) in sec_rows {
+            srows.sort_by_key(|r| r.ts);
+            let entry_row = srows.first().unwrap();
+            let exit_row = srows.last().unwrap();
+            if entry_row.delta_weight == Decimal::ZERO {
+                continue;
+            }
+            let entry_close = match prepared
+                .marks
+                .get(&(entry_row.ts, entry_row.security_id.clone()))
+            {
+                Some(m) => *m,
+                None => continue,
+            };
+            let entry_exec = entry_row.fill_mark_override.unwrap_or(entry_close);
+            let exit_close = match prepared
+                .marks
+                .get(&(exit_row.ts, exit_row.security_id.clone()))
+            {
+                Some(m) => *m,
+                None => continue,
+            };
+
+            if entry_row.delta_weight > Decimal::ZERO {
+                long_total += 1;
+                let leg_ret = (exit_close / entry_exec) - dec!(1.0);
+                if leg_ret > Decimal::ZERO {
+                    long_wins += 1;
+                }
+            } else {
+                short_total += 1;
+                let leg_ret = (entry_exec / exit_close) - dec!(1.0);
+                if leg_ret > Decimal::ZERO {
+                    short_wins += 1;
+                }
+            }
+        }
+
+        // Simulate trade return
+        let mut nav = dec!(1.0);
+        let mut portfolio = PortfolioState::new();
+
+        let end_idx = exit_idx.min(prepared.calendar.len().saturating_sub(1));
+        for idx in entry_idx..=end_idx {
+            let ts = prepared.calendar[idx];
+
+            if let Some(ts_rows) = rows_by_ts.get(&ts) {
+                let mut immediate_return = Decimal::ZERO;
+                for s in ts_rows {
+                    let close_mark = match prepared
+                        .marks
+                        .get(&(s.ts, s.security_id.clone()))
+                    {
+                        Some(m) => *m,
+                        None => continue,
+                    };
+                    let exec_mark = s.fill_mark_override.unwrap_or(close_mark);
+                    if exec_mark > Decimal::ZERO {
+                        immediate_return += s.delta_weight * ((close_mark / exec_mark) - dec!(1.0));
+                    }
+                    portfolio.apply_signal(s, exec_mark);
+                }
+                nav = nav * (dec!(1.0) + immediate_return);
+            }
+
+            if idx >= end_idx {
+                break;
+            }
+
+            let ts_next = prepared.calendar[idx + 1];
+            let mut interval_return = Decimal::ZERO;
+            for (sec, w) in portfolio.weights.iter() {
+                if *w == Decimal::ZERO {
+                    continue;
+                }
+                let m_now = match prepared.marks.get(&(ts, sec.clone())) {
+                    Some(m) => *m,
+                    None => continue,
+                };
+                let m_next = match prepared.marks.get(&(ts_next, sec.clone())) {
+                    Some(m) => *m,
+                    None => continue,
+                };
+                interval_return += *w * ((m_next / m_now) - dec!(1.0));
+            }
+            nav = nav * (dec!(1.0) + interval_return);
+        }
+
+        let trade_return = nav - dec!(1.0);
+        results.push(TradeResult {
+            trade_id,
+            entry,
+            exit,
+            trade_return,
+            holding_days: hold_days,
+        });
+        holding_days.push(hold_days);
+
+        if trade_return > Decimal::ZERO {
+            wins += 1;
+            win_sum += trade_return;
+        } else if trade_return < Decimal::ZERO {
+            losses += 1;
+            loss_sum += trade_return;
+        }
+    }
+
+    let total = results.len();
+    let win_rate = if total > 0 {
+        Decimal::from_f64_retain(wins as f64 / total as f64).unwrap_or(Decimal::ZERO)
+    } else {
+        Decimal::ZERO
+    };
+    let avg_win = if wins > 0 {
+        win_sum / Decimal::from(wins)
+    } else {
+        Decimal::ZERO
+    };
+    let avg_loss = if losses > 0 {
+        loss_sum / Decimal::from(losses)
+    } else {
+        Decimal::ZERO
+    };
+    let payoff_ratio = if avg_loss != Decimal::ZERO {
+        avg_win / avg_loss.abs()
+    } else {
+        Decimal::ZERO
+    };
+    let profit_factor = if loss_sum != Decimal::ZERO {
+        win_sum / loss_sum.abs()
+    } else {
+        Decimal::ZERO
+    };
+
+    let mut returns_f64 = Vec::new();
+    for r in &results {
+        if let Some(v) = r.trade_return.to_f64() {
+            returns_f64.push(v);
+        }
+    }
+
+    let mean_return = if !returns_f64.is_empty() {
+        let sum: f64 = returns_f64.iter().sum();
+        Decimal::from_f64_retain(sum / returns_f64.len() as f64).unwrap_or(Decimal::ZERO)
+    } else {
+        Decimal::ZERO
+    };
+    let std_return = if returns_f64.len() > 1 {
+        let mean = mean_return.to_f64().unwrap_or(0.0);
+        let var = returns_f64
+            .iter()
+            .map(|v| (v - mean).powi(2))
+            .sum::<f64>()
+            / returns_f64.len() as f64;
+        Decimal::from_f64_retain(var.sqrt()).unwrap_or(Decimal::ZERO)
+    } else {
+        Decimal::ZERO
+    };
+
+    holding_days.sort();
+    let avg_hold_days = if !holding_days.is_empty() {
+        let sum: i64 = holding_days.iter().sum();
+        Decimal::from_i64(sum).unwrap_or(Decimal::ZERO)
+            / Decimal::from(holding_days.len())
+    } else {
+        Decimal::ZERO
+    };
+    let median_hold_days = if holding_days.is_empty() {
+        Decimal::ZERO
+    } else if holding_days.len() % 2 == 1 {
+        Decimal::from_i64(holding_days[holding_days.len() / 2]).unwrap_or(Decimal::ZERO)
+    } else {
+        let mid = holding_days.len() / 2;
+        let a = holding_days[mid - 1];
+        let b = holding_days[mid];
+        Decimal::from_i64(a + b).unwrap_or(Decimal::ZERO) / dec!(2.0)
+    };
+
+    let long_hit_rate = if long_total > 0 {
+        Decimal::from_f64_retain(long_wins as f64 / long_total as f64)
+            .unwrap_or(Decimal::ZERO)
+    } else {
+        Decimal::ZERO
+    };
+    let short_hit_rate = if short_total > 0 {
+        Decimal::from_f64_retain(short_wins as f64 / short_total as f64)
+            .unwrap_or(Decimal::ZERO)
+    } else {
+        Decimal::ZERO
+    };
+
+    let stats = TradeStats {
+        total,
+        wins,
+        losses,
+        win_rate,
+        avg_win,
+        avg_loss,
+        payoff_ratio,
+        profit_factor,
+        mean_return,
+        std_return,
+        avg_hold_days,
+        median_hold_days,
+        long_hit_rate,
+        short_hit_rate,
+    };
+
+    (stats, results)
 }
 
 #[derive(Debug, Clone)]
@@ -580,10 +1020,36 @@ impl BacktestStats {
     }
 }
 
+fn compute_worst_day(equity: &[EquityPoint]) -> Option<(Ts, Decimal)> {
+    if equity.len() < 2 {
+        return None;
+    }
+    let mut worst = Decimal::ZERO;
+    let mut worst_ts = equity[1].ts;
+    for i in 1..equity.len() {
+        let prev = equity[i - 1].nav;
+        let cur = equity[i].nav;
+        if prev == Decimal::ZERO {
+            continue;
+        }
+        let r = (cur / prev) - dec!(1.0);
+        if i == 1 || r < worst {
+            worst = r;
+            worst_ts = equity[i].ts;
+        }
+    }
+    Some((worst_ts, worst))
+}
+
 fn print_summary(
     equity: &[EquityPoint],
     trade_total: usize,
     trade_dropped: usize,
+    exposure: ExposureStats,
+    turnover: TurnoverStats,
+    trade_stats: TradeStats,
+    drawdown: DrawdownStats,
+    worst_trades: &[TradeResult],
 ) {
     let stats = BacktestStats::calculate(equity);
     let trade_executed = trade_total.saturating_sub(trade_dropped);
@@ -592,6 +1058,7 @@ fn print_summary(
     } else {
         0.0
     };
+    let worst_day = compute_worst_day(equity);
 
     println!();
 
@@ -632,6 +1099,140 @@ fn print_summary(
     table.add_row(row!["", ""]);
 
     table.add_row(Row::new(vec![
+        Cell::new("Total Turnover (sum |delta_weight|)"),
+        Cell::new(&format!("{:.4}", turnover.total)),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Avg Daily Turnover"),
+        Cell::new(&format!("{:.4}", turnover.avg_daily)),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Max Daily Turnover"),
+        Cell::new(&format!("{:.4}", turnover.max_daily)),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Avg Gross Exposure"),
+        Cell::new(&format!("{:.4}", exposure.avg_gross)),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Max Gross Exposure"),
+        Cell::new(&format!("{:.4}", exposure.max_gross)),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Avg Net Exposure"),
+        Cell::new(&format!("{:.4}", exposure.avg_net)),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Max Net Exposure"),
+        Cell::new(&format!("{:.4}", exposure.max_net)),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Max Abs Position"),
+        Cell::new(&format!("{:.4}", exposure.max_abs_pos)),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Avg Holding Period (days)"),
+        Cell::new(&format!("{:.2}", trade_stats.avg_hold_days)),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Median Holding Period (days)"),
+        Cell::new(&format!("{:.2}", trade_stats.median_hold_days)),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Trade Count (executed)"),
+        Cell::new(&format!("{}", trade_stats.total)),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Win Rate"),
+        Cell::new(&format!("{:.2}%", trade_stats.win_rate * dec!(100.0))),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Trade Wins"),
+        Cell::new(&format!("{}", trade_stats.wins)).style_spec("Fg"),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Trade Losses"),
+        Cell::new(&format!("{}", trade_stats.losses)).style_spec("Fr"),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Avg Win"),
+        Cell::new(&format!("{:.4}%", trade_stats.avg_win * dec!(100.0))),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Avg Loss"),
+        Cell::new(&format!("{:.4}%", trade_stats.avg_loss * dec!(100.0))).style_spec("Fr"),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Payoff Ratio"),
+        Cell::new(&format!("{:.4}", trade_stats.payoff_ratio)),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Profit Factor"),
+        Cell::new(&format!("{:.4}", trade_stats.profit_factor)),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Trade Return Mean"),
+        Cell::new(&format!("{:.4}%", trade_stats.mean_return * dec!(100.0))),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Trade Return StdDev"),
+        Cell::new(&format!("{:.4}%", trade_stats.std_return * dec!(100.0))),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Long Leg Hit Rate"),
+        Cell::new(&format!("{:.2}%", trade_stats.long_hit_rate * dec!(100.0))),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Short Leg Hit Rate"),
+        Cell::new(&format!("{:.2}%", trade_stats.short_hit_rate * dec!(100.0))),
+    ]));
+
+    table.add_row(Row::new(vec![
+        Cell::new("Max DD Duration"),
+        Cell::new(&format!(
+            "{} -> {} ({}d)",
+            drawdown.start.0, drawdown.trough.0, drawdown.duration_days
+        )),
+    ]));
+
+    let recovery_str = match (drawdown.recovery, drawdown.recovery_days) {
+        (Some(ts), Some(days)) => format!("{} ({}d)", ts.0, days),
+        _ => "unrecovered".to_string(),
+    };
+    table.add_row(Row::new(vec![
+        Cell::new("Max DD Recovery"),
+        Cell::new(&recovery_str),
+    ]));
+
+    if let Some((ts, r)) = worst_day {
+        table.add_row(Row::new(vec![
+            Cell::new("Worst Day Return"),
+            Cell::new(&format!("{} ({:.4}%)", ts.0, r * dec!(100.0))).style_spec("Fr"),
+        ]));
+    }
+
+    table.add_row(Row::new(vec![
         Cell::new("Total Return"),
         Cell::new(&format!("{:.4}%", stats.total_return * dec!(100.0))),
     ]));
@@ -665,6 +1266,28 @@ fn print_summary(
     ]));
 
     table.printstd();
+
+    if !worst_trades.is_empty() {
+        let mut sorted = worst_trades.to_vec();
+        sorted.sort_by(|a, b| a.trade_return.cmp(&b.trade_return));
+
+        println!("\nWorst 5 Trades:");
+        let mut worst_table = Table::new();
+        worst_table.set_format(*format::consts::FORMAT_BOX_CHARS);
+        worst_table.add_row(row![bFc => "Trade ID", "Entry", "Exit", "Hold (d)", "Return"]);
+
+        for t in sorted.into_iter().take(5) {
+            worst_table.add_row(Row::new(vec![
+                Cell::new(&t.trade_id),
+                Cell::new(&t.entry.0.to_string()),
+                Cell::new(&t.exit.0.to_string()),
+                Cell::new(&format!("{}", t.holding_days)),
+                Cell::new(&format!("{:.4}%", t.trade_return * dec!(100.0))).style_spec("Fr"),
+            ]));
+        }
+
+        worst_table.printstd();
+    }
 
     println!("\nFirst 5 points:");
     for p in equity.iter().take(5) {
@@ -719,11 +1342,20 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     validate_trade_closure(&prepared.signals_by_ts)?;
 
-    let equity = compute_equity_curve(&prepared, mark_type)?;
+    let turnover = compute_turnover_stats(&prepared);
+    let (trade_stats, trade_results) = compute_trade_stats(&prepared);
+    let (equity, exposure) = compute_equity_curve(&prepared, mark_type)?;
+    let drawdown = compute_drawdown_stats(&equity);
+
     print_summary(
         &equity,
         prepared.trade_count_total,
         prepared.trade_count_dropped,
+        exposure,
+        turnover,
+        trade_stats,
+        drawdown,
+        &trade_results,
     );
 
     Ok(())
