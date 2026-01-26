@@ -228,7 +228,6 @@ struct PreparedData {
     marks: HashMap<(Ts, String), Decimal>,
     // signals by date
     signals_by_ts: BTreeMap<Ts, Vec<SignalRow>>,
-    securities: HashSet<String>,
 }
 
 fn prepare_data(
@@ -238,23 +237,82 @@ fn prepare_data(
 ) -> Result<PreparedData, Box<dyn Error>> {
     let mut marks_map: HashMap<(Ts, String), Decimal> = HashMap::new();
     let mut calendar_set: HashSet<Ts> = HashSet::new();
-    let mut securities: HashSet<String> = HashSet::new();
 
     for row in marks {
         if row.mark_type != mark_type {
             continue;
         }
         calendar_set.insert(row.ts);
-        securities.insert(row.security_id.clone());
         let key = (row.ts, row.security_id);
         if marks_map.insert(key, row.mark).is_some() {
             return Err("duplicate mark row for (ts,security_id,mark_type)".into());
         }
     }
 
-    let mut signals_by_ts: BTreeMap<Ts, Vec<SignalRow>> = BTreeMap::new();
+    let mut signals_by_trade: HashMap<String, Vec<SignalRow>> = HashMap::new();
     for s in signals {
-        securities.insert(s.security_id.clone());
+        signals_by_trade.entry(s.trade_id.clone()).or_default().push(s);
+    }
+
+    let mut valid_signals = Vec::new();
+    let mut dropped_trades = HashSet::new();
+
+    for (trade_id, mut rows) in signals_by_trade {
+        // Sort rows by ts for tenure check
+        rows.sort_by_key(|r| r.ts);
+
+        let mut has_all_marks = true;
+
+        // 1) Every signal row must have a mark on its ts
+        for r in &rows {
+            if !marks_map.contains_key(&(r.ts, r.security_id.clone())) {
+                has_all_marks = false;
+                break;
+            }
+        }
+
+        if has_all_marks {
+            // 2) Tenure coverage: for each security in the trade, we need marks for every 
+            // calendar date from its first signal to its last signal in this trade_id.
+            let mut sec_tenures: HashMap<String, (Ts, Ts)> = HashMap::new();
+            for r in &rows {
+                let entry = sec_tenures
+                    .entry(r.security_id.clone())
+                    .or_insert((r.ts, r.ts));
+                if r.ts < entry.0 { entry.0 = r.ts; }
+                if r.ts > entry.1 { entry.1 = r.ts; }
+            }
+
+            for (sec, (start, end)) in sec_tenures {
+                for ts in &calendar_set {
+                    if *ts >= start && *ts <= end {
+                        if !marks_map.contains_key(&(*ts, sec.clone())) {
+                            has_all_marks = false;
+                            break;
+                        }
+                    }
+                }
+                if !has_all_marks { break; }
+            }
+        }
+
+        if has_all_marks {
+            valid_signals.extend(rows);
+        } else {
+            dropped_trades.insert(trade_id);
+        }
+    }
+
+    if !dropped_trades.is_empty() {
+        println!(
+            "WARNING: dropped {} trade_ids due to missing marks (e.g. {:?})",
+            dropped_trades.len(),
+            dropped_trades.iter().take(3).collect::<Vec<_>>()
+        );
+    }
+
+    let mut signals_by_ts: BTreeMap<Ts, Vec<SignalRow>> = BTreeMap::new();
+    for s in valid_signals {
         signals_by_ts.entry(s.ts).or_default().push(s);
     }
 
@@ -265,7 +323,6 @@ fn prepare_data(
         calendar,
         marks: marks_map,
         signals_by_ts,
-        securities,
     })
 }
 
@@ -298,27 +355,6 @@ fn validate_trade_closure(signals: &BTreeMap<Ts, Vec<SignalRow>>) -> Result<(), 
         return Err(msg.into());
     }
 
-    Ok(())
-}
-
-fn validate_marks_coverage(
-    prepared: &PreparedData,
-    mark_type: MarkType,
-) -> Result<(), Box<dyn Error>> {
-    // Conservative validation: every security referenced in signals must have marks on every date
-    // in calendar (for drawdown). You can relax this later.
-    for ts in &prepared.calendar {
-        for sec in &prepared.securities {
-            let key = (*ts, sec.clone());
-            if !prepared.marks.contains_key(&key) {
-                return Err(format!(
-                    "missing mark for ts={:?} security_id={sec} mark_type={:?}",
-                    ts.0, mark_type
-                )
-                .into());
-            }
-        }
-    }
     Ok(())
 }
 
@@ -644,7 +680,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let prepared = prepare_data(marks, signals, mark_type.clone())?;
 
     validate_trade_closure(&prepared.signals_by_ts)?;
-    validate_marks_coverage(&prepared, mark_type.clone())?;
 
     let equity = compute_equity_curve(&prepared, mark_type)?;
     print_summary(&equity);
